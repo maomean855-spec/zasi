@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="km">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ប្រេងរឹត - ZASI POS</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- html2canvas for Download Receipt Feature -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+        window.firebaseAppInit = { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot };
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Battambang:wght@400;700;900&display=swap');
+        body { font-family: 'Battambang', sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-100 min-h-screen flex justify-center items-center">
+
+    <div id="root" class="max-w-md w-full bg-white min-h-screen shadow-2xl flex flex-col relative pb-24"></div>
+
+    <script type="module">
+        const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot } = window.firebaseAppInit;
+
+        let app, auth, db, appId = typeof __app_id !== 'undefined' ? __app_id : 'zasi-pos-app';
+        try {
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "demo", projectId: "demo" };
+            app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+        } catch(e) {
+            console.warn("Offline or Demo Mode");
+        }
+
+        const OWNER_PIN = "1234";
+        const SHOP_NAME = "ប្រេងរឹត - ZASI";
+        const SHOP_PHONE = "087475901";
+
+        let state = {
+            firebaseUser: null,
+            userRole: null, // 'owner' | 'employee'
+            sellerName: '',
+            loginStep: 'select',
+            loginError: '',
+            activeTab: 'pos', // 'pos' | 'inventory' | 'reports' | 'settings'
+            tgStatus: '',
+            reportFilter: 'monthly',
+            isModalOpen: false,
+            modalMode: 'add',
+            formData: { id: '', name: '', imageUrl: '', costPrice: 0, retailPrice: 0, wholesalePrice: 0, stockIn: 0, stockOut: 0 },
+            isExpenseModalOpen: false,
+            expenseForm: { title: '', amount: 0 },
+            isEditSaleModalOpen: false,
+            editingSale: null,
+            products: [],
+            sales: [],
+            expenses: [],
+            cart: [],
+            saleType: 'retail',
+            customerPhone: '',
+            deliveryFee: '',
+            shippingCompany: 'ភ្នំពេញ',
+            customerLocation: '',
+            discount: '',
+            paymentStatus: 'paid', // 'paid' | 'cod'
+            tgToken: '',
+            tgChatId: ''
+        };
+
+        function setState(newState) {
+            state = { ...state, ...newState };
+            render();
+        }
+
+        if (auth) {
+            onAuthStateChanged(auth, (user) => {
+                setState({ firebaseUser: user });
+                if (user && db) initFirestoreSync();
+            });
+            (async () => {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch(e) { console.error(e); }
+            })();
+        }
+
+        function initFirestoreSync() {
+            try {
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'products'), snap => {
+                    setState({ products: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+                });
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'sales'), snap => {
+                    const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    data.sort((a, b) => new Date(b.date) - new Date(a.date));
+                    setState({ sales: data });
+                });
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), snap => {
+                    const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    data.sort((a, b) => new Date(b.date) - new Date(a.date));
+                    setState({ expenses: data });
+                });
+                onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'settings_telegram'), docSnap => {
+                    if (docSnap.exists()) {
+                        setState({ tgToken: docSnap.data().token || '', tgChatId: docSnap.data().chatId || '' });
+                    }
+                });
+            } catch(e) { console.error(e); }
+        }
+
+        function showStatus(msg) {
+            setState({ tgStatus: msg });
+            setTimeout(() => setState({ tgStatus: '' }), 3000);
+        }
+
+        const getCurrentStock = (p) => (Number(p.stockIn) || 0) - (Number(p.stockOut) || 0);
+        const getBasePrice = (item) => state.saleType === 'retail' ? Number(item.retailPrice) || 0 : Number(item.wholesalePrice) || 0;
+        const getPrice = (item) => item.isFree ? 0 : getBasePrice(item);
+        const getSubTotal = () => state.cart.reduce((sum, item) => sum + (getPrice(item) * item.qty), 0);
+        const getGrandTotal = () => Math.max(0, getSubTotal() + Number(state.deliveryFee || 0) - Number(state.discount || 0));
+
+        window.processCheckout = async function() {
+            if (state.cart.length === 0) return;
+            try {
+                let totalCost = 0, totalRevenue = 0;
+                let stockToDeduct = {};
+                let savedItems = state.cart.map(item => {
+                    stockToDeduct[item.id] = (stockToDeduct[item.id] || 0) + item.qty;
+                    const dbProd = state.products.find(p => p.id === item.id);
+                    const cost = Number(dbProd?.costPrice) || 0;
+                    const sell = getPrice(item);
+                    totalCost += cost * item.qty;
+                    totalRevenue += sell * item.qty;
+                    return { id: item.id, name: item.name, qty: item.qty, costPrice: cost, sellPrice: sell, isFree: item.isFree };
+                });
+
+                let discountNum = Number(state.discount) || 0;
+                const netProfit = (totalRevenue - totalCost) - discountNum;
+                const grandTotal = getGrandTotal();
+
+                const saleData = {
+                    date: new Date().toISOString(),
+                    shopName: SHOP_NAME,
+                    shopPhone: SHOP_PHONE,
+                    sellerName: state.sellerName,
+                    saleType: state.saleType,
+                    customerPhone: state.customerPhone || 'មិនមាន',
+                    shippingCompany: state.shippingCompany,
+                    customerLocation: state.customerLocation || 'មិនបានបញ្ជាក់',
+                    paymentStatus: state.paymentStatus,
+                    items: savedItems,
+                    subTotal: getSubTotal(),
+                    deliveryFee: Number(state.deliveryFee) || 0,
+                    discount: discountNum,
+                    grandTotal: grandTotal,
+                    totalCost: totalCost,
+                    netProfit: netProfit
+                };
+
+                if (db) {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'sales'), saleData);
+                    for (const [id, qty] of Object.entries(stockToDeduct)) {
+                        const prod = state.products.find(p => p.id === id);
+                        if (prod) {
+                            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), {
+                                stockOut: (Number(prod.stockOut) || 0) + qty
+                            });
+                        }
+                    }
+                }
+
+                if (state.tgToken && state.tgChatId) {
+                    let msg = `🧾 <b>វិក្កយបត្រលក់ទំនិញ</b>\n🏪 <b>${SHOP_NAME}</b>\n📞 <b>${SHOP_PHONE}</b>\n--------------------------\n`;
+                    msg += `💳 ការទូទាត់: <b>${state.paymentStatus === 'paid' ? '✅ បង់ប្រាក់រួច' : '📦 COD'}</b>\n👤 អ្នកលក់: <b>${state.sellerName}</b>\n`;
+                    state.cart.forEach(i => { msg += `- ${i.name} x ${i.qty} = $${(getPrice(i)*i.qty).toFixed(2)}\n`; });
+                    msg += `--------------------------\n💰 <b>សរុប: $${grandTotal.toFixed(2)}</b>`;
+                    await fetch(`https://api.telegram.org/bot${state.tgToken}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: state.tgChatId, text: msg, parse_mode: 'HTML' })
+                    });
+                }
+
+                showStatus('ការលក់ជោគជ័យ!');
+                setState({ cart: [], customerPhone: '', deliveryFee: '', discount: '', customerLocation: '' });
+            } catch(e) { console.error(e); showStatus('មានបញ្ហាក្នុងការលក់'); }
+        };
+
+        window.downloadReceiptImage = function(saleId) {
+            const sale = state.sales.find(s => s.id === saleId);
+            if (!sale) return;
+
+            const container = document.createElement('div');
+            container.style.position = 'fixed';
+            container.style.left = '-9999px';
+            container.style.width = '350px';
+            container.style.background = '#ffffff';
+            container.style.padding = '20px';
+            container.style.fontFamily = 'Battambang, sans-serif';
+            container.style.borderRadius = '12px';
+
+            let itemsHtml = sale.items.map(i => `
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+                    <span>${i.name} x ${i.qty} ${i.isFree?'(Free)':''}</span>
+                    <span>$${(i.sellPrice * i.qty).toFixed(2)}</span>
+                </div>
+            `).join('');
+
+            container.innerHTML = `
+                <div style="text-align:center; border-bottom:2px dashed #cbd5e1; padding-bottom:10px; margin-bottom:10px;">
+                    <h2 style="font-size:16px; font-weight:bold; color:#1e293b; margin:0;">${sale.shopName}</h2>
+                    <p style="font-size:11px; color:#64748b; margin:2px 0;">ទូរស័ព្ទ: ${sale.shopPhone}</p>
+                    <p style="font-size:10px; color:#3b82f6; font-weight:bold;">វិក្កយបត្រផ្លូវការ (${sale.paymentStatus === 'cod' ? 'COD' : 'បង់រួច'})</p>
+                </div>
+                <div style="font-size:11px; color:#475569; margin-bottom:10px;">
+                    <p>កាលបរិច្ឆេទ: ${new Date(sale.date).toLocaleString('km-KH')}</p>
+                    <p>អតិថិជន: ${sale.customerPhone} | ${sale.shippingCompany}</p>
+                    <p>អ្នកលក់: ${sale.sellerName}</p>
+                </div>
+                <div style="border-bottom:1px solid #e2e8f0; padding-bottom:8px; margin-bottom:8px;">
+                    ${itemsHtml}
+                </div>
+                <div style="font-size:12px; display:flex; justify-content:space-between; font-weight:bold; color:#1e293b;">
+                    <span>សរុបទឹកប្រាក់:</span>
+                    <span style="color:#2563eb;">$${sale.grandTotal.toFixed(2)}</span>
+                </div>
+                <div style="text-align:center; margin-top:15px; font-size:10px; color:#94a3b8;">
+                    អរគុណសម្រាប់ការគាំទ្រហាងយើងខ្ញុំ! 🙏
+                </div>
+            `;
+
+            document.body.appendChild(container);
+            html2canvas(container).then(canvas => {
+                const link = document.createElement('a');
+                link.download = `Receipt-${sale.customerPhone || 'ZASI'}.png`;
+                link.href = canvas.toDataURL();
+                link.click();
+                document.body.removeChild(container);
+            });
+        };
+
+        function render() {
+            const root = document.getElementById('root');
+            if (!state.userRole) {
+                root.innerHTML = `
+                    <div class="min-h-screen bg-slate-900 flex items-center justify-center p-4 w-full">
+                        <div class="bg-white p-6 rounded-3xl shadow-2xl w-full max-w-sm">
+                            <div class="text-center mb-6">
+                                <div class="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-3">
+                                    <i data-lucide="store" class="w-8 h-8 text-blue-600"></i>
+                                </div>
+                                <h1 class="text-lg font-black text-gray-800">${SHOP_NAME}</h1>
+                                <p class="text-xs text-gray-500 font-bold mt-1">ទូរស័ព្ទ: ${SHOP_PHONE}</p>
+                            </div>
+                            ${state.loginStep === 'select' ? `
+                                <div class="space-y-3">
+                                    <p class="text-center text-gray-500 mb-4 text-xs font-bold">សូមជ្រើសរើសតួនាទីរបស់អ្នក</p>
+                                    <button onclick="window.setLogin('owner_pin')" class="w-full py-3.5 bg-blue-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-blue-200">
+                                        <i data-lucide="lock" class="w-4 h-4"></i> ចូលជា ម្ចាស់ហាង
+                                    </button>
+                                    <button onclick="window.setLogin('employee_name')" class="w-full py-3.5 bg-emerald-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-200">
+                                        <i data-lucide="shopping-cart" class="w-4 h-4"></i> ចូលជា បុគ្គលិកលក់
+                                    </button>
+                                </div>
+                            ` : state.loginStep === 'owner_pin' ? `
+                                <form onsubmit="window.handleOwnerLogin(event)" class="space-y-3">
+                                    <div class="text-center mb-2">
+                                        <i data-lucide="lock" class="w-6 h-6 text-blue-600 mx-auto mb-1"></i>
+                                        <p class="text-gray-500 text-xs font-bold">បញ្ចូលលេខសម្ងាត់ម្ចាស់ហាង (PIN: 1234)</p>
+                                    </div>
+                                    <input required autofocus type="password" maxlength="4" placeholder="* * * *" id="pinInput" class="w-full border-2 border-gray-200 rounded-xl p-3 outline-none focus:border-blue-500 font-bold text-center text-xl tracking-[0.5em]" />
+                                    ${state.loginError ? `<p class="text-red-500 text-[11px] font-bold text-center">${state.loginError}</p>` : ''}
+                                    <div class="flex gap-2 pt-2">
+                                        <button type="button" onclick="window.setLogin('select')" class="px-4 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm">ថយក្រោយ</button>
+                                        <button type="submit" class="flex-1 py-3 bg-blue-600 text-white rounded-xl font-bold text-sm">ចូលប្រព័ន្ធ</button>
+                                    </div>
+                                </form>
+                            ` : `
+                                <form onsubmit="window.handleEmpLogin(event)" class="space-y-3">
+                                    <p class="text-center text-gray-500 mb-3 text-xs font-bold">បញ្ចូលឈ្មោះរបស់អ្នក</p>
+                                    <input required autofocus type="text" placeholder="ឈ្មោះបុគ្គលិក..." id="empInput" class="w-full border-2 border-gray-200 rounded-xl p-3 outline-none focus:border-emerald-500 font-bold text-center text-sm" />
+                                    <div class="flex gap-2 pt-2">
+                                        <button type="button" onclick="window.setLogin('select')" class="px-4 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm">ថយក្រោយ</button>
+                                        <button type="submit" class="flex-1 py-3 bg-emerald-600 text-white rounded-xl font-bold text-sm">ចូលប្រព័ន្ធ</button>
+                                    </div>
+                                </form>
+                            `}
+                        </div>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            root.innerHTML = `
+                <div class="bg-slate-900 text-white px-4 py-3 flex justify-between items-center sticky top-0 z-30 shadow-md">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="store" class="w-5 h-5 text-blue-400"></i>
+                        <div>
+                            <span class="font-bold text-xs block">${SHOP_NAME}</span>
+                            <span class="text-[10px] text-slate-400">👤 ${state.userRole === 'owner' ? 'ម្ចាស់ហាង' : state.sellerName}</span>
+                        </div>
+                    </div>
+                    <button onclick="window.handleLogout()" class="text-red-400 bg-red-500/10 p-2 rounded-lg"><i data-lucide="log-out" class="w-4 h-4"></i></button>
+                </div>
+
+                ${state.tgStatus ? `<div class="bg-emerald-500 text-white px-4 py-2 text-xs font-bold text-center sticky top-[52px] z-20">${state.tgStatus}</div>` : ''}
+
+                <div class="flex-1 overflow-y-auto p-3 mb-16">
+                    ${state.activeTab === 'pos' ? renderPosTab() : state.activeTab === 'inventory' ? renderInventoryTab() : state.activeTab === 'reports' ? renderReportsTab() : renderSettingsTab()}
+                </div>
+
+                ${renderModals()}
+
+                <div class="bg-white border-t py-2 px-4 flex justify-around items-center fixed bottom-0 left-0 right-0 max-w-md mx-auto z-40 shadow-lg">
+                    <button onclick="window.setActiveTab('pos')" class="flex flex-col items-center gap-1 relative ${state.activeTab==='pos'?'text-blue-600 font-bold':'text-gray-400'}">
+                        <i data-lucide="shopping-cart" class="w-5 h-5"></i>
+                        ${state.cart.length>0?`<span class="absolute -top-1 -right-2 bg-red-500 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">${state.cart.length}</span>`:''}
+                        <span class="text-[10px]">បញ្ជរលក់</span>
+                    </button>
+                    <button onclick="window.setActiveTab('inventory')" class="flex flex-col items-center gap-1 ${state.activeTab==='inventory'?'text-blue-600 font-bold':'text-gray-400'}">
+                        <i data-lucide="box" class="w-5 h-5"></i>
+                        <span class="text-[10px]">ស្ដុក</span>
+                    </button>
+                    ${state.userRole === 'owner' ? `
+                        <button onclick="window.setActiveTab('reports')" class="flex flex-col items-center gap-1 ${state.activeTab==='reports'?'text-blue-600 font-bold':'text-gray-400'}">
+                            <i data-lucide="bar-chart-3" class="w-5 h-5"></i>
+                            <span class="text-[10px]">របាយការណ៍</span>
+                        </button>
+                        <button onclick="window.setActiveTab('settings')" class="flex flex-col items-center gap-1 ${state.activeTab==='settings'?'text-blue-600 font-bold':'text-gray-400'}">
+                            <i data-lucide="settings" class="w-5 h-5"></i>
+                            <span class="text-[10px]">កំណត់</span>
+                        </button>
+                    ` : ''}
+                </div>
+            `;
+            lucide.createIcons();
+        }
+
+        function renderPosTab() {
+            return `
+                <div class="space-y-3 pb-16">
+                    <div class="flex bg-white p-1 rounded-xl shadow-sm border">
+                        <button onclick="window.setSaleType('retail')" class="flex-1 py-2 text-xs font-bold rounded-lg ${state.saleType==='retail'?'bg-blue-600 text-white':'text-gray-500'}">លក់រាយ</button>
+                        <button onclick="window.setSaleType('wholesale')" class="flex-1 py-2 text-xs font-bold rounded-lg ${state.saleType==='wholesale'?'bg-blue-600 text-white':'text-gray-500'}">បោះដុំ</button>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2">
+                        ${state.products.map(p => {
+                            const stock = getCurrentStock(p);
+                            const isOut = stock <= 0;
+                            return `
+                                <div onclick="${isOut?'':'window.addToCart(\''+p.id+'\')'}" class="bg-white p-2.5 rounded-2xl border shadow-sm flex flex-col justify-between ${isOut?'opacity-50 grayscale':'active:scale-95 transition cursor-pointer'}">
+                                    <div>
+                                        ${p.imageUrl ? `<img src="${p.imageUrl}" class="w-full h-24 object-cover rounded-xl mb-2"/>` : `<div class="w-full h-20 bg-blue-50 rounded-xl mb-2 flex items-center justify-center text-blue-300"><i data-lucide="package" class="w-8 h-8"></i></div>`}
+                                        <h4 class="font-bold text-gray-800 text-xs line-clamp-1 mb-1">${p.name}</h4>
+                                        <span class="text-[10px] text-gray-400">សល់: <strong class="${stock>3?'text-emerald-600':'text-red-500'}">${stock}</strong></span>
+                                    </div>
+                                    <div class="mt-2 pt-2 border-t flex justify-between items-center">
+                                        <span class="text-xs font-black text-blue-600">$${state.saleType==='retail'?p.retailPrice:p.wholesalePrice}</span>
+                                        <div class="w-6 h-6 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center"><i data-lucide="plus" class="w-3.5 h-3.5"></i></div>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+
+                    <div class="bg-white p-3 rounded-2xl shadow-md border space-y-2.5 mt-4">
+                        <div class="text-center border-b pb-2 mb-2">
+                            <h3 class="font-black text-sm text-gray-900">${SHOP_NAME}</h3>
+                            <p class="text-[11px] text-gray-500 font-bold">ទូរស័ព្ទ: ${SHOP_PHONE}</p>
+                        </div>
+
+                        <div>
+                            <label class="text-[10px] font-bold text-gray-500 mb-1 block">ស្ថានភាពទូទាត់ប្រាក់</label>
+                            <div class="flex gap-2">
+                                <button onclick="window.setPaymentStatus('paid')" class="flex-1 py-1.5 rounded-xl text-xs font-bold border flex items-center justify-center gap-1 ${state.paymentStatus==='paid'?'bg-emerald-600 text-white border-emerald-600':'bg-slate-50 text-gray-600'}">បង់ប្រាក់រួច</button>
+                                <button onclick="window.setPaymentStatus('cod')" class="flex-1 py-1.5 rounded-xl text-xs font-bold border flex items-center justify-center gap-1 ${state.paymentStatus==='cod'?'bg-amber-600 text-white border-amber-600':'bg-slate-50 text-gray-600'}">COD (ពេលទទួល)</button>
+                            </div>
+                        </div>
+
+                        <div class="flex justify-between items-center border-b pb-2 pt-1">
+                            <h4 class="font-bold text-xs text-gray-800 flex items-center gap-1"><i data-lucide="receipt" class="w-4 h-4 text-blue-600"></i> វិក្កយបត្រ (${state.cart.length})</h4>
+                            ${state.cart.length>0?`<button onclick="window.clearCart()" class="text-[10px] text-red-500 font-bold">លុបទាំងអស់</button>`:''}
+                        </div>
+
+                        ${state.cart.length===0 ? `<p class="text-xs text-gray-400 text-center py-4">សូមជ្រើសរើសទំនិញខាងលើ</p>` : `
+                            <div class="space-y-2">
+                                <div class="space-y-1.5 max-h-40 overflow-y-auto">
+                                    ${state.cart.map(item => `
+                                        <div class="flex justify-between items-center p-2 rounded-xl border ${item.isFree?'bg-emerald-50 border-emerald-200':'bg-slate-50'}">
+                                            <div class="flex-1 pr-2">
+                                                <p class="text-xs font-bold text-gray-800 truncate">${item.name} ${item.isFree?'(Free)':''}</p>
+                                                <p class="text-[10px] text-gray-500">$${getBasePrice(item)} x ${item.qty}</p>
+                                            </div>
+                                            <div class="flex items-center gap-1.5">
+                                                <span class="text-xs font-black text-blue-600">$${(getPrice(item)*item.qty).toFixed(2)}</span>
+                                                <button onclick="window.toggleFreebie('${item.cartItemId}')" class="p-1 bg-emerald-100 text-emerald-700 rounded-lg"><i data-lucide="gift" class="w-3 h-3"></i></button>
+                                                <button onclick="window.removeFromCart('${item.cartItemId}')" class="p-1 bg-red-100 text-red-600 rounded-lg"><i data-lucide="trash-2" class="w-3 h-3"></i></button>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                                <div class="grid grid-cols-2 gap-2 pt-2 border-t">
+                                    <input type="tel" value="${state.customerPhone}" oninput="state.customerPhone=this.value" class="w-full border rounded-lg p-1.5 text-xs font-bold" placeholder="លេខទូរស័ព្ទ"/>
+                                    <input type="number" min="0" value="${state.discount}" oninput="state.discount=this.value" class="w-full border rounded-lg p-1.5 text-xs font-bold" placeholder="បញ្ចុះតម្លៃ ($)"/>
+                                </div>
+                                <div class="grid grid-cols-3 gap-2">
+                                    <input type="number" min="0" value="${state.deliveryFee}" oninput="state.deliveryFee=this.value" class="w-full border rounded-lg p-1.5 text-xs font-bold" placeholder="ថ្លៃដឹក ($)"/>
+                                    <select onchange="state.shippingCompany=this.value" class="w-full border rounded-lg p-1.5 text-xs font-bold bg-white">
+                                        <option value="ភ្នំពេញ">ភ្នំពេញ</option>
+                                        <option value="J&T Express">J&T Express</option>
+                                        <option value="VET Express">VET Express</option>
+                                    </select>
+                                    <input type="text" value="${state.customerLocation}" oninput="state.customerLocation=this.value" class="w-full border rounded-lg p-1.5 text-xs font-bold" placeholder="ទីតាំង..."/>
+                                </div>
+                                <div class="pt-2 border-t flex justify-between items-center">
+                                    <span class="text-xs font-bold text-gray-600">សរុបត្រូវបង់:</span>
+                                    <span class="text-lg font-black text-blue-600">$${getGrandTotal().toFixed(2)}</span>
+                                </div>
+                                <button onclick="window.processCheckout()" class="w-full py-3 bg-blue-600 text-white rounded-xl font-black text-xs flex items-center justify-center gap-1.5 shadow-md">
+                                    <i data-lucide="send" class="w-3.5 h-3.5"></i> បញ្ជាក់ការលក់ & បញ្ជូនវិក្កយបត្រ
+                                </button>
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderInventoryTab() {
+            return `
+                <div class="space-y-3 pb-16">
+                    <div class="flex justify-between items-center">
+                        <h3 class="font-black text-sm text-gray-800">📦 បញ្ជីស្ដុកទំនិញ</h3>
+                        ${state.userRole==='owner'?`<button onclick="window.openAddModal()" class="bg-blue-600 text-white px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1"><i data-lucide="plus" class="w-3.5 h-3.5"></i> បន្ថែម</button>`:''}
+                    </div>
+                    <div class="space-y-2">
+                        ${state.products.map(p => `
+                            <div class="bg-white p-3 rounded-2xl border shadow-sm flex justify-between items-center">
+                                <div class="flex items-center gap-3">
+                                    ${p.imageUrl ? `<img src="${p.imageUrl}" class="w-12 h-12 object-cover rounded-xl"/>` : `<div class="w-12 h-12 bg-slate-100 rounded-xl flex items-center justify-center text-slate-400"><i data-lucide="package" class="w-6 h-6"></i></div>`}
+                                    <div>
+                                        <h4 class="font-bold text-xs text-gray-800">${p.name}</h4>
+                                        <p class="text-[10px] text-gray-500 mt-0.5">រាយ: $${p.retailPrice} | ដុំ: $${p.wholesalePrice}</p>
+                                        <p class="text-[10px] font-bold text-emerald-600 mt-0.5">ស្ដុកសរុប: ${getCurrentStock(p)} (ចូល: ${p.stockIn || 0} | ចេញ: ${p.stockOut || 0})</p>
+                                    </div>
+                                </div>
+                                ${state.userRole==='owner'?`
+                                    <div class="flex gap-1.5">
+                                        <button onclick="window.openEditModal('${p.id}')" class="p-2 bg-slate-100 rounded-lg text-slate-600"><i data-lucide="edit" class="w-3.5 h-3.5"></i></button>
+                                        <button onclick="window.deleteProduct('${p.id}')" class="p-2 bg-red-50 rounded-lg text-red-500"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                                    </div>
+                                `:''}
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderReportsTab() {
+            const now = new Date();
+            const filteredSales = state.sales.filter(s => {
+                const d = new Date(s.date);
+                if (state.reportFilter === 'daily') return d.toDateString() === now.toDateString();
+                if (state.reportFilter === 'monthly') return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+                return d.getFullYear() === now.getFullYear();
+            });
+
+            const filteredExpenses = state.expenses.filter(e => {
+                const d = new Date(e.date);
+                if (state.reportFilter === 'daily') return d.toDateString() === now.toDateString();
+                if (state.reportFilter === 'monthly') return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+                return d.getFullYear() === now.getFullYear();
+            });
+
+            const totalSales = filteredSales.reduce((sum, s) => sum + s.grandTotal, 0);
+            const grossProfit = filteredSales.reduce((sum, s) => sum + (s.netProfit || 0), 0);
+            const totalExpenses = filteredExpenses.reduce((sum, e) => sum + e.amount, 0);
+            const netProfit = grossProfit - totalExpenses;
+
+            return `
+                <div class="space-y-3 pb-16">
+                    <div class="flex gap-1 bg-white p-1 rounded-xl border shadow-sm">
+                        <button onclick="window.setReportFilter('daily')" class="flex-1 py-1.5 rounded-lg text-[11px] font-bold ${state.reportFilter==='daily'?'bg-blue-600 text-white':'text-gray-500'}">ថ្ងៃ</button>
+                        <button onclick="window.setReportFilter('monthly')" class="flex-1 py-1.5 rounded-lg text-[11px] font-bold ${state.reportFilter==='monthly'?'bg-blue-600 text-white':'text-gray-500'}">ខែ</button>
+                        <button onclick="window.setReportFilter('yearly')" class="flex-1 py-1.5 rounded-lg text-[11px] font-bold ${state.reportFilter==='yearly'?'bg-blue-600 text-white':'text-gray-500'}">ឆ្នាំ</button>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2">
+                        <div class="bg-white p-3 rounded-2xl border shadow-sm">
+                            <span class="text-[10px] font-bold text-gray-400">ចំណូលសរុប (Sales)</span>
+                            <p class="text-base font-black text-blue-600">$${totalSales.toFixed(2)}</p>
+                        </div>
+                        <div class="bg-white p-3 rounded-2xl border shadow-sm">
+                            <span class="text-[10px] font-bold text-gray-400">ចំណាយសរុប (Expenses)</span>
+                            <p class="text-base font-black text-red-500">$${totalExpenses.toFixed(2)}</p>
+                        </div>
+                        <div class="bg-white p-3 rounded-2xl border shadow-sm col-span-2">
+                            <span class="text-[10px] font-bold text-gray-400">ប្រាក់ចំណេញសុទ្ធ (Net Profit)</span>
+                            <p class="text-xl font-black text-emerald-600">$${netProfit.toFixed(2)}</p>
+                        </div>
+                    </div>
+
+                    <div class="bg-white p-3 rounded-2xl border shadow-sm space-y-2">
+                        <h4 class="font-black text-xs text-gray-800">📋 ប្រវត្តិការលក់ & វិក្កយបត្រ</h4>
+                        <div class="space-y-2 max-h-60 overflow-y-auto">
+                            ${filteredSales.map(sale => `
+                                <div class="bg-slate-50 p-2.5 rounded-xl border text-xs space-y-1">
+                                    <div class="flex justify-between items-center border-b pb-1">
+                                        <span class="font-bold text-gray-800">${sale.customerPhone || 'អតិថិជន'} (${sale.shippingCompany})</span>
+                                        <div class="flex items-center gap-1">
+                                            <span class="px-2 py-0.5 rounded-full text-[9px] font-bold ${sale.paymentStatus==='cod'?'bg-amber-100 text-amber-700':'bg-emerald-100 text-emerald-700'}">${sale.paymentStatus==='cod'?'COD':'បង់រួច'}</span>
+                                            <button onclick="window.openEditSaleModal('${sale.id}')" class="p-1 bg-blue-50 text-blue-600 rounded" title="កែប្រែ"><i data-lucide="edit" class="w-3 h-3"></i></button>
+                                            <button onclick="window.downloadReceiptImage('${sale.id}')" class="p-1 bg-emerald-50 text-emerald-600 rounded" title="Download"><i data-lucide="download" class="w-3 h-3"></i></button>
+                                            <button onclick="window.deleteSale('${sale.id}')" class="p-1 bg-red-50 text-red-500 rounded" title="លុប"><i data-lucide="trash-2" class="w-3 h-3"></i></button>
+                                        </div>
+                                    </div>
+                                    <p class="text-[10px] text-gray-500">${new Date(sale.date).toLocaleString('km-KH')} | អ្នកលក់: ${sale.sellerName}</p>
+                                    <div class="flex justify-between items-center font-black text-blue-600 pt-1">
+                                        <span>សរុប:</span>
+                                        <span>$${sale.grandTotal.toFixed(2)}</span>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+
+                    <div class="bg-white p-3 rounded-2xl border shadow-sm space-y-2">
+                        <div class="flex justify-between items-center">
+                            <h4 class="font-black text-xs text-gray-800">💸 តារាងចំណាយផ្សេងៗ</h4>
+                            <button onclick="window.openExpenseModal()" class="bg-red-500 text-white px-2.5 py-1 rounded-xl text-[10px] font-bold flex items-center gap-1"><i data-lucide="plus" class="w-3 h-3"></i> ចំណាយ</button>
+                        </div>
+                        <div class="space-y-1.5 max-h-36 overflow-y-auto">
+                            ${filteredExpenses.map(exp => `
+                                <div class="flex justify-between items-center text-xs bg-red-50/50 p-2 rounded-xl">
+                                    <div>
+                                        <p class="font-bold text-gray-800">${exp.title}</p>
+                                        <span class="text-[9px] text-gray-400">${new Date(exp.date).toLocaleDateString('km-KH')}</span>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="font-black text-red-500">$${exp.amount.toFixed(2)}</span>
+                                        <button onclick="window.deleteExpense('${exp.id}')" class="text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderSettingsTab() {
+            return `
+                <div class="bg-white p-4 rounded-2xl border shadow-sm space-y-3">
+                    <h3 class="font-black text-sm text-gray-800">⚙️ ការកំណត់ Telegram Bot</h3>
+                    <div>
+                        <label class="text-xs font-bold text-gray-600">Telegram Bot Token</label>
+                        <input type="text" id="tgTokenInput" value="${state.tgToken}" class="w-full border rounded-xl p-2.5 text-xs" />
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-gray-600">Chat ID</label>
+                        <input type="text" id="tgChatIdInput" value="${state.tgChatId}" class="w-full border rounded-xl p-2.5 text-xs" />
+                    </div>
+                    <button onclick="window.saveTgSettings()" class="w-full py-3 bg-blue-600 text-white rounded-xl font-bold text-xs">រក្សាទុក</button>
+                </div>
+            `;
+        }
+
+        function renderModals() {
+            let html = '';
+            
+            if (state.isModalOpen) {
+                const f = state.formData;
+                html += `
+                    <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-end justify-center p-0">
+                        <div class="bg-white rounded-t-3xl shadow-2xl w-full p-5 space-y-3 max-h-[90vh] overflow-y-auto">
+                            <div class="flex justify-between items-center border-b pb-3">
+                                <h3 class="font-bold text-base text-gray-800">${state.modalMode === 'add' ? '➕ បន្ថែមទំនិញថ្មី' : '✏️ កែប្រែទំនិញ'}</h3>
+                                <button onclick="window.closeModal()" class="p-1.5 bg-gray-100 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form onsubmit="window.saveProduct(event)" class="space-y-3">
+                                <div>
+                                    <label class="text-xs font-bold text-gray-600">ឈ្មោះទំនិញ *</label>
+                                    <input required type="text" id="pName" value="${f.name || ''}" class="w-full border rounded-xl p-2.5 text-sm" />
+                                </div>
+                                <div>
+                                    <label class="text-xs font-bold text-gray-600">រូបភាព (URL)</label>
+                                    <input type="url" id="pImg" value="${f.imageUrl || ''}" class="w-full border rounded-xl p-2.5 text-sm" placeholder="https://..." />
+                                </div>
+                                <div class="grid grid-cols-3 gap-2">
+                                    <div>
+                                        <label class="text-[11px] font-bold text-red-500">តម្លៃដើម</label>
+                                        <input required type="number" step="0.01" id="pCost" value="${f.costPrice || 0}" class="w-full border rounded-xl p-2 text-xs font-bold text-red-600" />
+                                    </div>
+                                    <div>
+                                        <label class="text-[11px] font-bold text-blue-600">លក់រាយ</label>
+                                        <input required type="number" step="0.01" id="pRetail" value="${f.retailPrice || 0}" class="w-full border rounded-xl p-2 text-xs font-bold text-blue-600" />
+                                    </div>
+                                    <div>
+                                        <label class="text-[11px] font-bold text-purple-600">បោះដុំ</label>
+                                        <input required type="number" step="0.01" id="pWholesale" value="${f.wholesalePrice || 0}" class="w-full border rounded-xl p-2 text-xs font-bold text-purple-600" />
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="text-xs font-bold text-gray-600">ទិញចូល (Stock In)</label>
+                                        <input type="number" id="pStockIn" value="${f.stockIn || 0}" class="w-full border rounded-xl p-2.5 text-sm" />
+                                    </div>
+                                    <div>
+                                        <label class="text-xs font-bold text-gray-600">លក់ចេញ (Stock Out)</label>
+                                        <input type="number" id="pStockOut" value="${f.stockOut || 0}" class="w-full border rounded-xl p-2.5 text-sm" />
+                                    </div>
+                                </div>
+                                <button type="submit" class="w-full py-3 bg-blue-600 text-white rounded-xl font-bold text-sm mt-4">រក្សាទុក</button>
+                            </form>
+                        </div>
+                    </div>
+                `;
+            }
+
+            if (state.isEditSaleModalOpen && state.editingSale) {
+                const s = state.editingSale;
+                html += `
+                    <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-end justify-center p-0">
+                        <div class="bg-white rounded-t-3xl shadow-2xl w-full p-5 space-y-3 max-h-[90vh] overflow-y-auto">
+                            <div class="flex justify-between items-center border-b pb-3">
+                                <h3 class="font-bold text-base text-blue-600">✏️ កែប្រែព័ត៌មានការលក់</h3>
+                                <button onclick="window.closeEditSaleModal()" class="p-1.5 bg-gray-100 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form onsubmit="window.updateSale(event)" class="space-y-3">
+                                <div>
+                                    <label class="text-xs font-bold text-gray-600">ស្ថានភាពទូទាត់</label>
+                                    <div class="flex gap-2 mt-1">
+                                        <button type="button" onclick="window.setEditingStatus('paid')" class="flex-1 py-2 rounded-xl text-xs font-bold border ${s.paymentStatus === 'paid' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-50 text-gray-600'}">✅ បង់ប្រាក់រួច</button>
+                                        <button type="button" onclick="window.setEditingStatus('cod')" class="flex-1 py-2 rounded-xl text-xs font-bold border ${s.paymentStatus === 'cod' ? 'bg-amber-600 text-white border-amber-600' : 'bg-slate-50 text-gray-600'}">📦 COD (ពេលទទួល)</button>
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="text-xs font-bold text-gray-600">លេខទូរស័ព្ទ</label>
+                                        <input type="tel" id="editPhone" value="${s.customerPhone === 'មិនមាន' ? '' : s.customerPhone}" class="w-full border rounded-xl p-2 text-xs font-bold" />
+                                    </div>
+                                    <div>
+                                        <label class="text-xs font-bold text-gray-600">ក្រុមហ៊ុនដឹក</label>
+                                        <select id="editShipping" class="w-full border rounded-xl p-2 text-xs font-bold bg-white">
+                                            <option value="ភ្នំពេញ" ${s.shippingCompany==='ភ្នំពេញ'?'selected':''}>ភ្នំពេញ</option>
+                                            <option value="J&T Express" ${s.shippingCompany==='J&T Express'?'selected':''}>J&T Express</option>
+                                            <option value="VET Express" ${s.shippingCompany==='VET Express'?'selected':''}>VET Express</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="text-xs font-bold text-gray-600">ថ្លៃដឹក ($)</label>
+                                        <input type="number" step="0.01" id="editDelivery" value="${s.deliveryFee || 0}" class="w-full border rounded-xl p-2 text-xs font-bold" />
+                                    </div>
+                                    <div>
+                                        <label class="text-xs font-bold text-gray-600">បញ្ចុះតម្លៃ ($)</label>
+                                        <input type="number" step="0.01" id="editDiscount" value="${s.discount || 0}" class="w-full border rounded-xl p-2 text-xs font-bold" />
+                                    </div>
+                                </div>
+                                <button type="submit" class="w-full py-3 bg-blue-600 text-white rounded-xl font-bold text-sm mt-2">រក្សាទុកការកែប្រែ</button>
+                            </form>
+                        </div>
+                    </div>
+                `;
+            }
+
+            if (state.isExpenseModalOpen) {
+                html += `
+                    <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-end justify-center p-0">
+                        <div class="bg-white rounded-t-3xl shadow-2xl w-full p-5 space-y-3">
+                            <div class="flex justify-between items-center border-b pb-3">
+                                <h3 class="font-bold text-base text-red-600">💸 បន្ថែមចំណាយថ្មី</h3>
+                                <button onclick="window.closeExpenseModal()" class="p-1.5 bg-gray-100 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form onsubmit="window.saveExpense(event)" class="space-y-3">
+                                <div>
+                                    <label class="text-xs font-bold text-gray-600">បរិយាយចំណាយ *</label>
+                                    <input required type="text" id="expTitle" class="w-full border rounded-xl p-2.5 text-sm" placeholder="ឧ. ថ្លៃភ្លើង..." />
+                                </div>
+                                <div>
+                                    <label class="text-xs font-bold text-gray-600">ទឹកប្រាក់ ($) *</label>
+                                    <input required type="number" step="0.01" id="expAmount" class="w-full border rounded-xl p-2.5 text-sm font-bold text-red-600" placeholder="0.00" />
+                                </div>
+                                <button type="submit" class="w-full py-3 bg-red-600 text-white rounded-xl font-bold text-sm mt-2">រក្សាទុកចំណាយ</button>
+                            </form>
+                        </div>
+                    </div>
+                `;
+            }
+
+            return html;
+        }
+
+        window.setLogin = (step) => setState({ loginStep: step });
+        window.handleOwnerLogin = (e) => {
+            e.preventDefault();
+            const val = document.getElementById('pinInput').value;
+            if (val === OWNER_PIN) setState({ userRole: 'owner', sellerName: 'ម្ចាស់ហាង' });
+            else setState({ loginError: 'លេខសម្ងាត់មិនត្រឹមត្រូវ' });
+        };
+        window.handleEmpLogin = (e) => {
+            e.preventDefault();
+            const val = document.getElementById('empInput').value;
+            if (val.trim()) setState({ userRole: 'employee', sellerName: val });
+        };
+        window.handleLogout = () => setState({ userRole: null, sellerName: '', loginStep: 'select', cart: [] });
+        window.setActiveTab = (tab) => setState({ activeTab: tab });
+        window.setSaleType = (t) => setState({ saleType: t });
+        window.setPaymentStatus = (p) => setState({ paymentStatus: p });
+        window.setReportFilter = (f) => setState({ reportFilter: f });
+
+        window.addToCart = (id) => {
+            const prod = state.products.find(p => p.id === id);
+            if (!prod) return;
+            const existing = state.cart.find(i => i.id === id && !i.isFree);
+            if (existing) {
+                setState({ cart: state.cart.map(i => (i.id === id && !i.isFree) ? { ...i, qty: i.qty + 1 } : i) });
+            } else {
+                setState({ cart: [...state.cart, { ...prod, qty: 1, isFree: false, cartItemId: Math.random().toString() }] });
+            }
+        };
+
+        window.toggleFreebie = (cartItemId) => {
+            setState({ cart: state.cart.map(i => i.cartItemId === cartItemId ? { ...i, isFree: !i.isFree } : i) });
+        };
+
+        window.removeFromCart = (cartItemId) => {
+            setState({ cart: state.cart.filter(i => i.cartItemId !== cartItemId) });
+        };
+
+        window.clearCart = () => setState({ cart: [] });
+
+        window.openAddModal = () => setState({ isModalOpen: true, modalMode: 'add', formData: {} });
+        window.openEditModal = (id) => {
+            const p = state.products.find(prod => prod.id === id);
+            if (p) setState({ isModalOpen: true, modalMode: 'edit', formData: p });
+        };
+        window.closeModal = () => setState({ isModalOpen: false });
+
+        window.saveProduct = async (e) => {
+            e.preventDefault();
+            const f = state.formData;
+            const prodData = {
+                name: document.getElementById('pName').value,
+                imageUrl: document.getElementById('pImg').value,
+                costPrice: Number(document.getElementById('pCost').value) || 0,
+                retailPrice: Number(document.getElementById('pRetail').value) || 0,
+                wholesalePrice: Number(document.getElementById('pWholesale').value) || 0,
+                stockIn: Number(document.getElementById('pStockIn').value) || 0,
+                stockOut: Number(document.getElementById('pStockOut').value) || 0
+            };
+            if (db) {
+                if (state.modalMode === 'add') {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'products'), prodData);
+                } else {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', f.id), prodData);
+                }
+            }
+            setState({ isModalOpen: false });
+        };
+
+        window.deleteProduct = async (id) => {
+            if (confirm("តើអ្នកចង់លុបទំនិញនេះមែនទេ?") && db) {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id));
+            }
+        };
+
+        window.openExpenseModal = () => setState({ isExpenseModalOpen: true });
+        window.closeExpenseModal = () => setState({ isExpenseModalOpen: false });
+        window.saveExpense = async (e) => {
+            e.preventDefault();
+            const title = document.getElementById('expTitle').value;
+            const amount = Number(document.getElementById('expAmount').value) || 0;
+            if (db) {
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), {
+                    title, amount, date: new Date().toISOString()
+                });
+            }
+            setState({ isExpenseModalOpen: false });
+        };
+        window.deleteExpense = async (id) => {
+            if (confirm("តើអ្នកចង់លុបការចំណាយនេះមែនទេ?") && db) {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'expenses', id));
+            }
+        };
+
+        window.openEditSaleModal = (saleId) => {
+            const sale = state.sales.find(s => s.id === saleId);
+            if (sale) setState({ isEditSaleModalOpen: true, editingSale: { ...sale } });
+        };
+        window.closeEditSaleModal = () => setState({ isEditSaleModalOpen: false, editingSale: null });
+        window.setEditingStatus = (status) => {
+            setState({ editingSale: { ...state.editingSale, paymentStatus: status } });
+        };
+
+        window.updateSale = async (e) => {
+            e.preventDefault();
+            const s = state.editingSale;
+            if (!s || !db) return;
+            const deliveryFee = Number(document.getElementById('editDelivery').value) || 0;
+            const discount = Number(document.getElementById('editDiscount').value) || 0;
+            const grandTotal = Math.max(0, (s.subTotal || 0) + deliveryFee - discount);
+
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'sales', s.id), {
+                paymentStatus: s.paymentStatus,
+                customerPhone: document.getElementById('editPhone').value || 'មិនមាន',
+                shippingCompany: document.getElementById('editShipping').value,
+                deliveryFee: deliveryFee,
+                discount: discount,
+                grandTotal: grandTotal
+            });
+            setState({ isEditSaleModalOpen: false, editingSale: null });
+            showStatus('កែប្រែការលក់ជោគជ័យ!');
+        };
+
+        window.deleteSale = async (saleId) => {
+            if (!confirm("តើអ្នកពិតជាចង់លុបការលក់នេះមែនទេ? ស្តុកទំនិញនឹងត្រូវបង្វិលត្រឡប់វិញ។")) return;
+            const sale = state.sales.find(s => s.id === saleId);
+            if (sale && db) {
+                for (const item of (sale.items || [])) {
+                    const prod = state.products.find(p => p.id === item.id);
+                    if (prod) {
+                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', item.id), {
+                            stockOut: Math.max(0, (Number(prod.stockOut) || 0) - Number(item.qty))
+                        });
+                    }
+                }
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'sales', saleId));
+                showStatus('លុបការលក់ និងបង្វិលស្តុកជោគជ័យ!');
+            }
+        };
+
+        window.saveTgSettings = async () => {
+            const token = document.getElementById('tgTokenInput').value;
+            const chatId = document.getElementById('tgChatIdInput').value;
+            if (db) {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings_telegram'), { token, chatId });
+                showStatus('រក្សាទុកការកំណត់ជោគជ័យ!');
+            }
+        };
+
+        render();
+    </script>
+</body>
+</html>
